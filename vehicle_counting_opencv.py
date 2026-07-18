@@ -12,9 +12,8 @@ except Exception:
     plt = None
 
 # ---- Tunable parameters -------------------------------------------------
-MIN_CONTOUR_AREA = 250        # pixels; ignore blobs smaller than this
-DIFF_THRESHOLD = 35           # 0-255; absolute difference threshold
-REFERENCE_WARMUP_FRAMES = 30  # frames used to build background
+MIN_CONTOUR_AREA = 200        # pixels; ignore blobs smaller than this
+REFERENCE_IMAGE_PATH = "intersection1.png"  # Path to your static reference image
 ROI_CONFIG_FILE = "lane_rois.json"
 
 DEFAULT_LANE_ROIS = {
@@ -34,22 +33,28 @@ def roi_pixels(frame_shape, roi_fraction):
     x1, y1, x2, y2 = roi_fraction
     return int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
 
-def build_static_reference(cap, warmup_frames=REFERENCE_WARMUP_FRAMES):
-    frames = []
-    print(f"Building background reference ({warmup_frames} frames)...")
-    for _ in range(warmup_frames):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-    if not frames:
-        raise RuntimeError("Could not read frames for background calibration.")
-    return np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
-
-def count_contours_in_mask(mask, min_area=MIN_CONTOUR_AREA):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    count = sum(1 for c in contours if cv2.contourArea(c) >= min_area)
-    return count
+def load_static_reference(image_path, target_shape=None):
+    """
+    Loads the background reference image as grayscale and auto-scales it 
+    to match the video resolution to prevent dimensions mismatch errors.
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Reference image file not found at: {image_path}")
+        
+    print(f"Loading static background reference from image: {image_path}...")
+    ref_img = cv2.imread(image_path)
+    if ref_img is None:
+        raise RuntimeError(f"Could not read or decode the image file: {image_path}")
+        
+    gray_ref = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+    
+    # Auto-adjust shape if video size differs from the image template size
+    if target_shape is not None and gray_ref.shape[:2] != target_shape[:2]:
+        print(f"[!] Auto-resizing reference image from {gray_ref.shape[1]}x{gray_ref.shape[0]} "
+              f"to match video frame dimensions {target_shape[1]}x{target_shape[0]}")
+        gray_ref = cv2.resize(gray_ref, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_LINEAR)
+        
+    return gray_ref
 
 class LiveChart:
     def __init__(self, lane_names, history_seconds=60):
@@ -64,7 +69,7 @@ class LiveChart:
         self.history = {name: deque() for name in lane_names}
 
         plt.ion()
-        self.fig, (self.ax_bar, self.ax_line) = plt.subplots(1, 2, figsize=(10, 4))
+        self.fig, (self.ax_bar, self.ax_line) = plt.subplots(1, 2, figsize=(8, 4))
 
         self.bars = self.ax_bar.bar(lane_names, [0] * len(lane_names), color="tab:orange")
         self.ax_bar.set_ylim(0, 10)
@@ -123,32 +128,63 @@ def main(video_path, show_window=True, post_url=None):
         print(f"Error: Cannot open video file {video_path}")
         return
 
-    reference = build_static_reference(cap)
-    chart = LiveChart(lane_names)
+    # Warmup check: read the first frame to safely query the video size dimensions
+    ret, first_frame = cap.read()
+    if not ret:
+        print("Error: Video source file is empty or corrupt.")
+        cap.release()
+        return
+
+    # Pass the shape parameters to ensure our template matches perfectly
+    reference = load_static_reference(REFERENCE_IMAGE_PATH, target_shape=first_frame.shape)
     
+    # Pre-blur the reference frame once to improve pixel background subtraction speed
+    blurred_reference = cv2.GaussianBlur(reference, (5, 5), 0)
+    
+    chart = LiveChart(lane_names)
     frame_count = 0
 
     while True:
-        ret, frame = cap.read()
+        # Step handling to reuse our pre-read first frame correctly
+        if frame_count == 0:
+            frame = first_frame
+            ret = True
+        else:
+            ret, frame = cap.read()
+            
         if not ret:
             break
 
         frame_count += 1
 
-        # Image preprocessing
+        # Step 1: Image preprocessing
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Difference masking
-        diff = cv2.absdiff(gray, reference)
-        _, mask = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        # Step 2: Adaptive masking logic using dynamic Otsu threshold tracking
+        diff = cv2.absdiff(gray, blurred_reference)
+        _, mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Morphological noise-cleaning operations
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, np.ones((5, 5), np.uint8), iterations=2)
 
+        # Step 3: Count tracking inside segmented lane regions
         lane_counts = {}
         for lane_name, roi in lane_rois.items():
             x1, y1, x2, y2 = roi_pixels(frame.shape, roi)
-            count = count_contours_in_mask(mask[y1:y2, x1:x2])
+            roi_mask = mask[y1:y2, x1:x2]
+            
+            contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            count = 0
+            for c in contours:
+                if cv2.contourArea(c) >= MIN_CONTOUR_AREA:
+                    x, y, w, h = cv2.boundingRect(c)
+                    # Filter out skinny lightning artifacts, dust lines, or cross-lane boundary errors
+                    if w > 12 and h > 12: 
+                        count += 1
+                        
             lane_counts[lane_name] = count
 
             if show_window:
@@ -158,14 +194,14 @@ def main(video_path, show_window=True, post_url=None):
 
         print(f"[COUNT] {lane_counts}")
 
-        # PERFORMANCE BOOST: Only update the slow chart window every 30 frames (~once a second)
+        # Performance-safe chart data update steps (once every ~1 second)
         if frame_count % 30 == 0:
             chart.update(lane_counts)
 
         if post_url:
             try:
                 import requests
-                requests.post(post_url, json=lane_counts, timeout=0.2) # Fast timeout
+                requests.post(post_url, json=lane_counts, timeout=0.2)
             except Exception:
                 pass
 
