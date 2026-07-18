@@ -6,7 +6,7 @@ import sys
 
 # Default values of signal timers
 defaultGreen = {0: 10, 1: 10}  # 0: West, 1: South
-defaultRed = 20
+defaultRed = 25
 defaultYellow = 3
 
 signals = []
@@ -222,7 +222,7 @@ class Main:
     screenSize = (screenWidth, screenHeight)
 
     screen = pygame.display.set_mode(screenSize)
-    pygame.display.set_caption("T-JUNCTION ALIGNED SIMULATION")
+    pygame.display.set_caption("T-JUNCTION SIMULATION")
 
     # FIX (supports bug 2 - "turn right only after moving up a little from
     # where it stopped"): there was no clock/FPS cap anywhere in the main

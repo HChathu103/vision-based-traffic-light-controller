@@ -31,7 +31,7 @@ Run it:
     (defaults to http://127.0.0.1:5000)
 
 Then point the counter at it:
-    python vehicle_counting_opencv.py --source 2026final.mp4 \
+    python vehicle_counting_opencv.py --source Traffic.mp4 \
         --post-url http://127.0.0.1:5000/update_counts
 
 Check what it decided:
