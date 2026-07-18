@@ -33,7 +33,6 @@ This project is a small end-to-end prototype that simulates an intersection, cou
 ├── traffic_waiting_history.png    # Generated history graph
 ├── traffic_summary.txt            # Generated statistics
 ├── images/                        # Vehicle and signal images
-
 └── README.md
 ```
 ---
@@ -259,7 +258,7 @@ The current system focuses on monitoring and analyzing traffic conditions throug
 
 **Harsha Chathuranga**
 
-UNdergraduate student of Electrical and Electronic Engineering
+Undergraduate student of Electrical and Electronic Engineering
 
 Faculty of Engineering
 
