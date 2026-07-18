@@ -1,146 +1,126 @@
-"""
-calibrate_rois.py
-------------------
-One-time helper to draw the "waiting zone" box for each lane, by hand,
-on a real frame from your video/camera - instead of guessing pixel
-coordinates in code.
-
-Why this matters:
-Hardcoded pixel boxes (like the North/South/East/West fractions in the
-original script) only line up by luck. The camera angle, resolution,
-or window position will be different every time you record. This tool
-lets you click-drag a rectangle directly on a real frame so the boxes
-always match what the camera actually sees.
-
-Usage:
-    python calibrate_rois.py --source Traffic.mp4
-    python calibrate_rois.py --source 0                     # webcam
-    python calibrate_rois.py --source http://<esp32-ip>:81/stream
-
-Controls:
-    - Click and drag to draw a rectangle for one lane's waiting zone.
-    - Press a letter/number key to LABEL and SAVE that rectangle
-      (e.g. press 'w' for "West", 's' for "South"...). You'll be
-      prompted in the terminal for the lane name after each drag.
-    - Press 'u' to undo the last saved ROI.
-    - Press 'q' to quit and write lane_rois.json.
-
-
-"""
-
 import argparse
 import json
-import sys
-
+import os
 import cv2
+import numpy as np
 
+# Global variables to handle mouse interaction
 drawing = False
 ix, iy = -1, -1
 current_box = None
-saved_rois = {}
+rois = {}
+current_lane_index = 1
 
+def select_lane_name():
+    global current_lane_index
+    name = f"Lane_{current_lane_index}"
+    current_lane_index += 1
+    return name
 
 def mouse_callback(event, x, y, flags, param):
-    global drawing, ix, iy, current_box
+    global ix, iy, drawing, current_box, rois, frame_w, frame_h
 
     if event == cv2.EVENT_LBUTTONDOWN:
         drawing = True
         ix, iy = x, y
-        current_box = None
+        current_box = (x, y, x, y)
 
-    elif event == cv2.EVENT_MOUSEMOVE and drawing:
-        current_box = (min(ix, x), min(iy, y), max(ix, x), max(iy, y))
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if drawing:
+            current_box = (ix, iy, x, y)
 
     elif event == cv2.EVENT_LBUTTONUP:
         drawing = False
-        current_box = (min(ix, x), min(iy, y), max(ix, x), max(iy, y))
+        x1, y1 = min(ix, x), min(iy, y)
+        x2, y2 = max(ix, x), max(iy, y)
+        
+        # Ensure the box actually has a width and height
+        if (x2 - x1) > 10 and (y2 - y1) > 10:
+            lane_name = select_lane_name()
+            # Save as relative fractions (0.0 to 1.0) so it's resolution-independent
+            rois[lane_name] = (
+                round(x1 / frame_w, 4),
+                round(y1 / frame_h, 4),
+                round(x2 / frame_w, 4),
+                round(y2 / frame_h, 4)
+            )
+            print(f"Added {lane_name}: {rois[lane_name]}")
+        current_box = None
 
+def main():
+    global frame_w, frame_h, current_box, rois
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default="0", help="Video file path, '0' for webcam, or stream URL")
+    parser.add_argument("--output", default="lane_rois.json", help="JSON file destination")
+    args = parser.parse_args()
 
-def main(source):
-    # NOTE: current_box and saved_rois are assigned to later in this
-    # function (e.g. `current_box = None`, `del saved_rois[...]`). In
-    # Python, assigning to a name ANYWHERE inside a function makes that
-    # name local to the WHOLE function - including lines above the
-    # assignment that only read it. Without this `global` declaration,
-    # the earlier `if current_box:` read raises UnboundLocalError.
-    global current_box, saved_rois
-
-    cap = cv2.VideoCapture(int(source) if str(source).isdigit() else source)
+    # Open video source
+    src = int(args.source) if args.source.isdigit() else args.source
+    cap = cv2.VideoCapture(src)
     if not cap.isOpened():
-        print(f"Could not open source: {source}")
-        sys.exit(1)
+        print(f"Error: Could not open video source {src}")
+        return
 
-    # Grab a representative frame (skip the first few, sometimes blank/dark)
-    frame = None
-    for _ in range(10):
-        ret, frame = cap.read()
-        if not ret:
-            print("Could not read a frame from the source.")
-            sys.exit(1)
-    cap.release()
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read the first frame from the video source.")
+        cap.release()
+        return
 
-    h, w = frame.shape[:2]
-    print(f"Frame size: {w}x{h}")
-    print("Draw a rectangle over each lane's waiting/queue zone, then")
-    print("type the lane name in this terminal when prompted.\n")
+    frame_h, frame_w = frame.shape[:2]
+    
+    cv2.namedWindow("ROI Calibration Tool")
+    cv2.setMouseCallback("ROI Calibration Tool", mouse_callback)
 
-    cv2.namedWindow("Calibrate ROIs")
-    cv2.setMouseCallback("Calibrate ROIs", mouse_callback)
+    print("\n--- ROI CALIBRATION INSTRUCTIONS ---")
+    print("1. Click and drag left mouse button to draw a box around a lane.")
+    print("2. Press 'c' to clear all defined zones and start fresh.")
+    print("3. Press 's' to save the current boxes to JSON and exit.")
+    print("4. Press 'q' to quit without saving.\n")
 
     while True:
-        display = frame.copy()
+        # Clone the pristine frame copy to draw fresh graphics onto
+        display_frame = frame.copy()
 
-        # Draw already-saved ROIs
-        for name, (x1, y1, x2, y2) in saved_rois.items():
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(display, name, (x1 + 4, y1 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # Draw already saved ROIs
+        for name, coords in rois.items():
+            x1 = int(coords[0] * frame_w)
+            y1 = int(coords[1] * frame_h)
+            x2 = int(coords[2] * frame_w)
+            y2 = int(coords[3] * frame_h)
+            
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(display_frame, name, (x1 + 5, y1 + 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # Draw the box currently being dragged
+        # Draw the active live-dragged box if it exists
         if current_box:
-            cv2.rectangle(display, current_box[:2], current_box[2:], (0, 200, 255), 2)
+            cv2.rectangle(display_frame, (current_box[0], current_box[1]), 
+                          (current_box[2], current_box[3]), (255, 0, 0), 2)
 
-        cv2.putText(display, "drag=box  s=save last box  u=undo  q=quit+write json",
-                    (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        cv2.imshow("Calibrate ROIs", display)
-        key = cv2.waitKey(20) & 0xFF
-
-        if key == ord('s') and current_box:
-            name = input("Lane name for this box (e.g. West, South): ").strip()
-            if name:
-                # Store as fractions of width/height so it survives resolution changes
-                x1, y1, x2, y2 = current_box
-                saved_rois[name] = (x1, y1, x2, y2)
-                print(f"Saved ROI for '{name}': {current_box}")
-            current_box = None
-
-        elif key == ord('u') and saved_rois:
-            last_key = list(saved_rois.keys())[-1]
-            del saved_rois[last_key]
-            print(f"Removed last ROI: {last_key}")
-
-        elif key == ord('q'):
+        cv2.imshow("ROI Calibration Tool", display_frame)
+        
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('q'):
+            print("Exited calibration without saving changes.")
+            break
+        elif key == ord('c'):
+            rois.clear()
+            global current_lane_index
+            current_lane_index = 1
+            print("Cleared all calibrated regions.")
+        elif key == ord('s'):
+            if not rois:
+                print("No ROIs calibrated. Nothing to save.")
+                continue
+            with open(args.output, 'w') as f:
+                json.dump(rois, f, indent=4)
+            print(f"\nSuccessfully saved configuration mapping to {args.output}!")
             break
 
+    cap.release()
     cv2.destroyAllWindows()
 
-    # Convert pixel boxes -> fractions of frame size (resolution-independent)
-    fractional = {
-        name: (x1 / w, y1 / h, x2 / w, y2 / h)
-        for name, (x1, y1, x2, y2) in saved_rois.items()
-    }
-
-    with open("lane_rois.json", "w") as f:
-        json.dump(fractional, f, indent=2)
-
-    print("\nSaved lane_rois.json:")
-    print(json.dumps(fractional, indent=2))
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default="0",
-                         help="video file, webcam index, or stream URL")
-    args = parser.parse_args()
-    main(args.source)
+    main()
