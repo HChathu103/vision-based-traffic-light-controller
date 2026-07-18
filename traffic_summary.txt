@@ -1,8 +1,8 @@
 ============================================================
                    TRAFFIC ANALYSIS METRICS                     
 ============================================================
-Generated at: 2026-07-18 20:14:27
-Total Monitoring Time: 82.00 seconds
+Generated at: 2026-07-18 20:30:36
+Total Monitoring Time: 86.16 seconds
 
 Lane Name    | Avg Vehicles    | Max Vehicles    | Congestion Ratio*
 ------------------------------------------------------------
