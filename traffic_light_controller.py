@@ -1,134 +1,151 @@
+"""
+traffic_light_controller.py
+----------------------------
+Small Flask server that sits between the OpenCV vehicle counter and the
+traffic-light simulation/hardware, and decides how much GREEN TIME each
+lane should get, based on how many vehicles are currently waiting there.
 
+Flow:
+    vehicle_counting_opencv.py  --(POST /update_counts, JSON per-lane counts)-->
+        traffic_light_controller.py  --(computes green times)-->
+            GET /green_times  <-- simulation / hardware polls this
 
-import heapq
-import time
+Scheduling method: GREEDY PROPORTIONAL ALLOCATION
+--------------------------------------------------
+No ML, easy to explain in a viva:
+
+  1. Every lane gets a guaranteed MIN_GREEN (fairness - nobody starves).
+  2. Whatever cycle time is left over (BASE_CYCLE_SECONDS - all the
+     MIN_GREEN's already handed out) is split between lanes IN
+     PROPORTION to how many vehicles are waiting there right now.
+  3. Nothing is allowed to go below MIN_GREEN or above MAX_GREEN.
+  4. If every lane is empty (or no counts have arrived yet), everyone
+     just gets a default, equal share - no reason to favor one lane.
+
+This is "greedy" in the sense that the busiest lane right now gets the
+biggest slice of the extra time - it doesn't plan multiple cycles
+ahead, it just reacts to the latest counts.
+
+Run it:
+    python traffic_light_controller.py
+    (defaults to http://127.0.0.1:5000)
+
+Then point the counter at it:
+    python vehicle_counting_opencv.py --source 2026final.mp4 \
+        --post-url http://127.0.0.1:5000/update_counts
+
+Check what it decided:
+    curl http://127.0.0.1:5000/green_times
+    curl http://127.0.0.1:5000/status        # counts + green times + age
+"""
+
 import threading
-from flask import Flask, request, jsonify
+import time
 
-try:
-    from vehicle_counting_opencv import normalize_lane_counts
-except Exception:  # pragma: no cover - fallback if module import fails
-    def normalize_lane_counts(counts, lane_names=None):
-        return counts
+from flask import Flask, jsonify, request
 
-# ----------------------------- CONFIG -----------------------------------
-LANES = ["North", "South", "East", "West"]
-CYCLE_TIME = 90         # total seconds shared per cycle
-MIN_GREEN = 10          # safety minimum per lane (4 lanes -> 40 seconds)
-# No artificial cap on lane counts; use raw counts from detector/simulation
-MAX_LANE_COUNT = None
-MAX_GREEN = CYCLE_TIME - MIN_GREEN * (len(LANES) - 1)
+# ---- Tunable scheduling parameters --------------------------------------
+MIN_GREEN = 5          # seconds - every lane gets at least this much
+MAX_GREEN = 30          # seconds - cap, so one lane can't hog forever
+BASE_CYCLE_SECONDS = 40  # total green seconds to split across all lanes
+                         # (must be >= MIN_GREEN * number_of_lanes)
+STALE_AFTER_SECONDS = 15  # if no new counts arrive for this long, counts
+                           # are considered stale and we fall back to
+                           # equal green times (fail-safe, not "frozen"
+                           # on old data)
 
 app = Flask(__name__)
-latest_counts = {lane: 0 for lane in LANES}
-lock = threading.Lock()
+
+_lock = threading.Lock()
+_state = {
+    "counts": {},          # last received {lane: count}
+    "green_times": {},     # last computed {lane: seconds}
+    "last_updated": 0.0,   # time.time() of last /update_counts call
+}
 
 
-# ------------------- CORE ALGORITHM: GREEDY + MAX-HEAP -------------------
-def compute_green_times(counts: dict) -> dict:
-    """Return a dynamic green-time plan for all lanes.
+def compute_green_times(counts, min_green=MIN_GREEN, max_green=MAX_GREEN,
+                         base_cycle=BASE_CYCLE_SECONDS):
+    """Greedy proportional allocation - see module docstring."""
+    lanes = list(counts.keys())
+    if not lanes:
+        return {}
 
-    The cycle allocates the required 40 seconds as safety minimum time
-    across 4 lanes and then distributes the remaining 50 seconds using a
-    greedy max-heap ranking based on current vehicle counts (capped at 8).
-    """
-    normalized_counts = normalize_lane_counts(counts, LANES)
-    # use raw, non-capped counts
-    clipped_counts = {
-        lane: max(int(normalized_counts.get(lane, 0)), 0)
-        for lane in LANES
-    }
-    total_weight = sum(clipped_counts.values())
+    guaranteed_total = min_green * len(lanes)
+    extra_pool = max(0, base_cycle - guaranteed_total)
 
-    if total_weight == 0:
-        equal = CYCLE_TIME / len(LANES)
-        return {lane: int(equal) for lane in LANES}
+    total_waiting = sum(max(0, c) for c in counts.values())
 
-    heap = [(-clipped_counts[lane], lane) for lane in LANES]
-    heapq.heapify(heap)
+    green_times = {}
+    if total_waiting == 0:
+        # Nobody waiting anywhere - split evenly, no reason to favor a lane
+        equal_share = min_green + extra_pool / len(lanes)
+        for lane in lanes:
+            green_times[lane] = int(round(min(max_green, equal_share)))
+        return green_times
 
-    remaining = CYCLE_TIME - MIN_GREEN * len(LANES)
-    raw_times = {}
+    for lane in lanes:
+        share = max(0, counts[lane]) / total_waiting
+        raw_time = min_green + share * extra_pool
+        green_times[lane] = int(round(min(max_green, max(min_green, raw_time))))
 
-    while heap:
-        neg_count, lane = heapq.heappop(heap)
-        weight = clipped_counts[lane]
-        raw_times[lane] = MIN_GREEN + remaining * (weight / total_weight)
-
-    rounded_times = {lane: int(raw_times[lane]) for lane in LANES}
-    delta = CYCLE_TIME - sum(rounded_times.values())
-
-    for lane in sorted(LANES, key=lambda item: raw_times[item] - rounded_times[item], reverse=True):
-        if delta == 0:
-            break
-        rounded_times[lane] += 1
-        delta -= 1
-
-    return {lane: min(MAX_GREEN, rounded_times[lane]) for lane in LANES}
+    return green_times
 
 
-def log_plan_summary(counts: dict):
-    """Print the counts, capped weights, and green-time calculation to the terminal."""
-    normalized_counts = normalize_lane_counts(counts, LANES)
-    clipped_counts = {
-        lane: max(int(normalized_counts.get(lane, 0)), 0)
-        for lane in LANES
-    }
-    total_weight = sum(clipped_counts.values())
-    remaining_dynamic_time = CYCLE_TIME - MIN_GREEN * len(LANES)
-
-    print("\n[COUNT UPDATE]")
-    print(f"Raw vehicle counts: {counts}")
-    print(f"Capped counts used for allocation: {clipped_counts}")
-    print(f"Total weighted vehicles: {total_weight}")
-    print(f"Safety minimum per lane: {MIN_GREEN}s")
-    print(f"Remaining dynamic time to distribute: {remaining_dynamic_time}s")
-
-    plan = compute_green_times(counts)
-    print(f"Computed green times: {plan}")
-    return plan
-
-
-# ------------------------------ HTTP API ---------------------------------
 @app.route("/update_counts", methods=["POST"])
 def update_counts():
-    """vehicle_counting_opencv.py calls this every cycle."""
-    global latest_counts
-    data = request.get_json(force=True)
-    with lock:
-        latest_counts.update(data)
-    log_plan_summary(data)
-    return jsonify({"status": "ok", "received": data})
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "expected a JSON object of {lane: count}"}), 400
+
+    counts = {str(lane): int(count) for lane, count in payload.items()}
+    green_times = compute_green_times(counts)
+
+    with _lock:
+        _state["counts"] = counts
+        _state["green_times"] = green_times
+        _state["last_updated"] = time.time()
+
+    return jsonify({"received": counts, "green_times": green_times})
 
 
-@app.route("/current_plan", methods=["GET"])
-def current_plan():
-    with lock:
-        counts_snapshot = dict(latest_counts)
-    plan = log_plan_summary(counts_snapshot)
-    return jsonify({"counts": counts_snapshot, "green_times_seconds": plan})
+@app.route("/green_times", methods=["GET"])
+def green_times():
+    with _lock:
+        age = time.time() - _state["last_updated"] if _state["last_updated"] else None
+        stale = age is None or age > STALE_AFTER_SECONDS
+
+        if stale:
+            # Fail-safe: don't act on old/no data, fall back to a neutral
+            # equal split among whatever lanes we last knew about.
+            lanes = list(_state["counts"].keys())
+            if lanes:
+                fallback = compute_green_times({lane: 0 for lane in lanes})
+            else:
+                fallback = {}
+            return jsonify({"green_times": fallback, "stale": True, "age_seconds": age})
+
+        return jsonify({"green_times": _state["green_times"], "stale": False, "age_seconds": age})
 
 
-def control_loop():
-    """Runs forever: every CYCLE_TIME seconds, recompute and push a plan."""
-    while True:
-        with lock:
-            counts_snapshot = dict(latest_counts)
-        plan = log_plan_summary(counts_snapshot)
-        time.sleep(CYCLE_TIME)
-
-
-def get_current_plan(counts: dict = None):
-    """Return the green-time plan for the supplied counts without requiring Flask."""
-    if counts is None:
-        with lock:
-            counts = dict(latest_counts)
-    return compute_green_times(counts)
+@app.route("/status", methods=["GET"])
+def status():
+    with _lock:
+        age = time.time() - _state["last_updated"] if _state["last_updated"] else None
+        return jsonify({
+            "counts": _state["counts"],
+            "green_times": _state["green_times"],
+            "age_seconds": age,
+            "min_green": MIN_GREEN,
+            "max_green": MAX_GREEN,
+            "base_cycle_seconds": BASE_CYCLE_SECONDS,
+        })
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=control_loop, daemon=True)
-    t.start()
-    print("Traffic controller running: POST vehicle counts to /update_counts")
-    print("GET /current_plan to see the latest computed plan")
-    app.run(host="0.0.0.0", port=5000)
+    print(f"Scheduler config: MIN_GREEN={MIN_GREEN}s  MAX_GREEN={MAX_GREEN}s  "
+          f"BASE_CYCLE_SECONDS={BASE_CYCLE_SECONDS}s")
+    print("POST counts to      http://127.0.0.1:5000/update_counts")
+    print("Poll decisions at   http://127.0.0.1:5000/green_times")
+    print("Full status at      http://127.0.0.1:5000/status")
+    app.run(host="0.0.0.0", port=5000, debug=False)
